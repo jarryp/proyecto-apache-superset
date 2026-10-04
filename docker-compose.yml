@@ -1,0 +1,139 @@
+name: inversiones-palacios-bi
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ip_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # :Z relabela el bind mount para SELinux (Fedora/RHEL) con un
+      # contexto privado de este contenedor; en sistemas sin SELinux
+      # (Debian/Ubuntu, macOS, Windows/WSL) la opción se ignora sin efecto.
+      - ./db/init:/docker-entrypoint-initdb.d:ro,Z
+      - ./data:/data:ro,Z
+    ports:
+      # Puerto opcional expuesto al host solo para inspección/pruebas
+      # (psql, DBeaver). Se puede eliminar sin afectar a Superset, que
+      # se conecta por la red interna "bi_net".
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      # -h 127.0.0.1 fuerza a comprobar el socket TCP real. Sin él,
+      # pg_isready comprueba por defecto el socket Unix local, que ya
+      # responde "accepting connections" durante el arranque interno
+      # temporal que initdb usa para correr /docker-entrypoint-initdb.d
+      # -antes- de que el servidor definitivo escuche por TCP: eso
+      # produce un falso "healthy" y hace que superset-init intente
+      # conectarse antes de tiempo ("Connection refused").
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [bi_net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: ip_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [bi_net]
+
+  # Contenedor de un solo uso: migra la base de metadatos, crea el usuario
+  # admin, inicializa roles/permisos y construye + registra el dashboard
+  # completo vía la API REST de Superset. Es la pieza clave de
+  # reproducibilidad: todo el dashboard se reconstruye por código en cada
+  # "docker compose up --build", sin un solo clic manual.
+  superset-init:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    image: inversiones_palacios/superset:4.1.1-custom
+    container_name: ip_superset_init
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment: &superset_env
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: db
+      POSTGRES_PORT_INTERNAL: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      SUPERSET_META_DB: ${SUPERSET_META_DB}
+      REDIS_HOST: redis
+      REDIS_PORT_INTERNAL: "6379"
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ADMIN_FIRSTNAME: ${ADMIN_FIRSTNAME}
+      ADMIN_LASTNAME: ${ADMIN_LASTNAME}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ANALYTICS_DB_NAME: ${POSTGRES_DB}
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro,z
+      - ./superset/init:/app/init:ro,Z
+    entrypoint: ["/bin/bash", "/app/init/entrypoint.sh"]
+    restart: "no"
+    networks: [bi_net]
+
+  superset:
+    image: inversiones_palacios/superset:4.1.1-custom
+    container_name: ip_superset
+    restart: unless-stopped
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    environment: *superset_env
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro,z
+      - superset_home:/app/superset_home
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [bi_net]
+
+  superset-worker:
+    image: inversiones_palacios/superset:4.1.1-custom
+    container_name: ip_superset_worker
+    restart: unless-stopped
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    environment: *superset_env
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro,z
+      - superset_home:/app/superset_home
+    command: ["celery", "--app=superset.tasks.celery_app:app", "worker", "--loglevel=INFO"]
+    # La imagen base de Superset trae un HEALTHCHECK pensado para el
+    # webserver (curl a /health), que no aplica a un worker de Celery
+    # (no expone HTTP) y siempre marcaría "unhealthy" sin indicar un
+    # problema real. Se desactiva explícitamente para este servicio.
+    healthcheck:
+      disable: true
+    networks: [bi_net]
+
+networks:
+  bi_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redis_data:
+  superset_home:
